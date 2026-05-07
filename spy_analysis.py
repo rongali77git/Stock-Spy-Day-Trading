@@ -101,6 +101,9 @@ def kill_switch_triggered(close: float, ema9: float, stack: str) -> bool:
 
 # ── Data fetch ────────────────────────────────────────────────────────────────
 
+MARKET_OPEN  = time(9, 30)
+MARKET_CLOSE = time(16, 0)
+
 def fetch_spy(period: str = "5d", interval: str = "5m") -> pd.DataFrame:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -121,6 +124,10 @@ def fetch_spy(period: str = "5d", interval: str = "5m") -> pd.DataFrame:
         df.index = df.index.tz_localize("America/New_York")
     else:
         df.index = df.index.tz_convert("America/New_York")
+
+    # Strip pre-market and after-hours — VWAP must anchor to 9:30 AM open
+    df = df[df.index.time >= MARKET_OPEN]
+    df = df[df.index.time <= MARKET_CLOSE]
 
     return df
 

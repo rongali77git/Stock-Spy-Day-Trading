@@ -105,6 +105,101 @@ def calc_vwap(df: pd.DataFrame) -> pd.Series:
     return cum_tp_vol / cum_vol
 
 
+def detect_180(
+    df: pd.DataFrame,
+    ema9_series: pd.Series,
+    vwap_series: pd.Series,
+) -> dict:
+    """
+    Detect a Bull or Bear 180 engulfing reversal on the two most recent bars.
+
+    Bull 180: fat red candle followed by a green candle that fully engulfs it
+              (current close >= previous open).
+    Bear 180: fat green candle followed by a red candle that fully engulfs it
+              (current close <= previous open).
+
+    Pattern is then classified as:
+      BREAKAWAY — reversal happening right at 9 EMA or VWAP (highest probability)
+      SNAPBACK  — reversal happening while price is stretched far from 9 EMA
+      STANDARD  — reversal with no special level context
+    """
+    empty = {"detected": False, "direction": None, "patternType": None, "anchor": None, "description": None}
+    if len(df) < 2:
+        return empty
+
+    prev = df.iloc[-2]
+    curr = df.iloc[-1]
+
+    prev_open  = float(prev["Open"])
+    prev_close = float(prev["Close"])
+    curr_open  = float(curr["Open"])
+    curr_close = float(curr["Close"])
+    prev_ema9  = float(ema9_series.iloc[-2])
+    curr_ema9  = float(ema9_series.iloc[-1])
+    curr_vwap  = float(vwap_series.iloc[-1])
+
+    prev_body = abs(prev_close - prev_open)
+
+    # Fat candle: body >= $0.50 OR >= 0.1% of price (whichever is larger)
+    fat_threshold = max(0.50, curr_close * 0.001)
+
+    prev_is_fat   = prev_body >= fat_threshold
+    prev_is_red   = prev_close < prev_open
+    prev_is_green = prev_close > prev_open
+    curr_is_green = curr_close > curr_open
+    curr_is_red   = curr_close < curr_open
+
+    # Full engulf: current candle closes beyond the previous candle's open
+    bull_180 = prev_is_fat and prev_is_red   and curr_is_green and curr_close >= prev_open
+    bear_180 = prev_is_fat and prev_is_green and curr_is_red   and curr_close <= prev_open
+
+    if not bull_180 and not bear_180:
+        return empty
+
+    direction = "BULL" if bull_180 else "BEAR"
+
+    # Proximity to key levels
+    near_ema9 = abs(curr_close - curr_ema9) <= 0.75
+    near_vwap = abs(curr_close - curr_vwap) <= 0.75
+    # Snapback: previous bar was stretched far from EMA9 before the reversal
+    was_stretched = abs(prev_close - prev_ema9) > 1.00
+
+    if near_ema9:
+        pattern_type = "BREAKAWAY"
+        anchor = "9 EMA"
+    elif near_vwap:
+        pattern_type = "BREAKAWAY"
+        anchor = "VWAP"
+    elif was_stretched:
+        pattern_type = "SNAPBACK"
+        anchor = None
+    else:
+        pattern_type = "STANDARD"
+        anchor = None
+
+    dir_word = "Bull" if direction == "BULL" else "Bear"
+    if pattern_type == "BREAKAWAY":
+        desc = (
+            f"{dir_word} 180 breakaway at {anchor} — fat candle engulfed right at the key level. "
+            f"High-probability reversal."
+        )
+    elif pattern_type == "SNAPBACK":
+        desc = (
+            f"{dir_word} 180 snapback — price was stretched ${abs(prev_close - prev_ema9):.2f} "
+            f"from 9 EMA, now reverting hard."
+        )
+    else:
+        desc = f"{dir_word} 180 engulfing — fat candle wiped out, momentum has shifted."
+
+    return {
+        "detected": True,
+        "direction": direction,       # BULL | BEAR
+        "patternType": pattern_type,  # BREAKAWAY | SNAPBACK | STANDARD
+        "anchor": anchor,             # "9 EMA" | "VWAP" | None
+        "description": desc,
+    }
+
+
 @app.get("/api/analysis")
 async def get_analysis(
     ticker: str = Query(default="SPY"),
@@ -125,7 +220,6 @@ async def get_analysis(
     df = df.copy()
     df.index = pd.to_datetime(df.index)
 
-    # Ensure index is timezone-aware in ET so we can filter to today's session only
     if df.index.tzinfo is None:
         df.index = df.index.tz_localize("UTC").tz_convert(ET)
     else:
@@ -134,11 +228,8 @@ async def get_analysis(
     today_et = now_et.date()
     session_start = pd.Timestamp(today_et).tz_localize(ET).replace(hour=9, minute=30)
 
-    # Keep only today's bars from market open onward — this ensures VWAP
-    # resets cleanly each session and pre-market / prior-day bars are excluded
     df_today = df[(df.index.date == today_et) & (df.index >= session_start)]
 
-    # Fall back to full df if market is closed / no regular-hours bars yet
     if df_today.empty:
         df_today = df
 
@@ -150,7 +241,6 @@ async def get_analysis(
     vwap = float(vwap_series.iloc[-1])
     last_bar_time = df_today.index[-1].isoformat()
 
-    # gate2Stack
     if current_price > ema9 and ema9 > vwap:
         gate2_stack = "BULLISH"
     elif vwap > ema9 and ema9 > current_price:
@@ -158,15 +248,12 @@ async def get_analysis(
     else:
         gate2_stack = "NEUTRAL"
 
-    # physicalKissSeen: any session candle whose range came within $0.10 of the 9 EMA
     physical_kiss_seen = bool(
         ((df_today["Low"] <= ema9_series + 0.10) & (df_today["High"] >= ema9_series - 0.10)).any()
     )
 
-    # rubberBandOk: price is within $0.25 of EMA9
     rubber_band_ok = bool(abs(current_price - ema9) < 0.25)
 
-    # killSwitchActive: last candle closed on wrong side of 9 EMA vs gate direction
     if gate2_stack == "BULLISH":
         kill_switch_active = current_price < ema9
     elif gate2_stack == "BEARISH":
@@ -174,7 +261,6 @@ async def get_analysis(
     else:
         kill_switch_active = False
 
-    # Opening Range Breakout (ORB) — first 15 minutes: 9:30–9:45 AM ET
     orb_cutoff = pd.Timestamp(today_et).tz_localize(ET).replace(hour=9, minute=45)
     orb_bars = df_today[df_today.index < orb_cutoff]
     orb_established = (now_et.time() >= time(9, 45)) and (not orb_bars.empty)
@@ -193,37 +279,15 @@ async def get_analysis(
         orb_low = None
         orb_breakout = "NONE"
 
-    # marketOpen: 9:30 AM – 4:00 PM ET, weekdays only
     t = now_et.time()
     in_macro_window = (now_et.weekday() < 5) and (time(9, 55) <= t <= time(10, 5))
     market_open = (now_et.weekday() < 5) and (time(9, 30) <= t <= time(16, 0))
 
-    # No-entry time zones (all ET)
     NO_ENTRY_ZONES = [
-        {
-            "name": "Opening Trap",
-            "start": time(9, 30),
-            "end": time(9, 45),
-            "message": "Opening trap window — algos are faking direction. Wait for structure to form.",
-        },
-        {
-            "name": "10 AM Macro Candle",
-            "start": time(9, 55),
-            "end": time(10, 5),
-            "message": "10 AM macro candle — economic data releases move the market. Wait for the dust to settle.",
-        },
-        {
-            "name": "Lunch Chop Zone",
-            "start": time(12, 0),
-            "end": time(13, 0),
-            "message": "Lunch chop zone — low volume, no conviction. Stand aside.",
-        },
-        {
-            "name": "End of Day",
-            "start": time(15, 45),
-            "end": time(16, 0),
-            "message": "End of day — theta crush in final 15 minutes. Close open positions, no new entries.",
-        },
+        {"name": "Opening Trap", "start": time(9, 30), "end": time(9, 45), "message": "Opening trap window — algos are faking direction. Wait for structure to form."},
+        {"name": "10 AM Macro Candle", "start": time(9, 55), "end": time(10, 5), "message": "10 AM macro candle — economic data releases move the market. Wait for the dust to settle."},
+        {"name": "Lunch Chop Zone", "start": time(12, 0), "end": time(13, 0), "message": "Lunch chop zone — low volume, no conviction. Stand aside."},
+        {"name": "End of Day", "start": time(15, 45), "end": time(16, 0), "message": "End of day — theta crush in final 15 minutes. Close open positions, no new entries."},
     ]
 
     active_zone = None
@@ -239,13 +303,15 @@ async def get_analysis(
         "message": active_zone["message"] if active_zone else None,
     }
 
-    # ORB confirmation requirement (only applies when ORB is established and no time gate is active)
     orb_confirms_bullish = orb_established and orb_breakout == "UP"
     orb_confirms_bearish = orb_established and orb_breakout == "DOWN"
-    # Before 9:45, Opening Trap zone already blocks — ORB not yet a factor
     orb_required = orb_established and active_zone is None
 
-    # tradeSignal determination
+    # 180 pattern detection
+    pattern_180 = detect_180(df_today, ema9_series, vwap_series)
+    p180_confirms_bullish = pattern_180["detected"] and pattern_180["direction"] == "BULL"
+    p180_confirms_bearish = pattern_180["detected"] and pattern_180["direction"] == "BEAR"
+
     bullish_conditions = (
         gate2_stack == "BULLISH"
         and physical_kiss_seen
@@ -265,23 +331,49 @@ async def get_analysis(
         and (not orb_required or orb_confirms_bearish)
     )
 
-    # High conviction when ORB and LE Model agree
-    high_conviction = (bullish_conditions and orb_confirms_bullish) or (bearish_conditions and orb_confirms_bearish)
+    high_conviction = (
+        (bullish_conditions and orb_confirms_bullish)
+        or (bearish_conditions and orb_confirms_bearish)
+    )
+    ultra_conviction = (
+        (high_conviction and bullish_conditions and p180_confirms_bullish)
+        or (high_conviction and bearish_conditions and p180_confirms_bearish)
+    )
 
     if bullish_conditions:
         trade_signal = "CALLS"
-        conviction = " ★ High conviction — ORB + LE Model aligned." if high_conviction else ""
+        if ultra_conviction:
+            conviction_tag = " ★★ Ultra conviction — ORB + LE Model + Bull 180 all aligned."
+        elif high_conviction:
+            conviction_tag = " ★ High conviction — ORB + LE Model aligned."
+        else:
+            conviction_tag = ""
         signal_reason = (
             f"{ticker} is bullish: price ({current_price:.2f}) > EMA9 ({ema9:.2f}) > VWAP ({vwap:.2f}), "
-            f"rubber band tight, kiss confirmed.{conviction}"
+            f"rubber band tight, kiss confirmed.{conviction_tag}"
         )
+        if p180_confirms_bullish:
+            signal_reason += f" {pattern_180['description']}"
+        elif p180_confirms_bearish:
+            signal_reason += f" ⚠ Conflicting Bear 180 on last bar — proceed with caution."
+
     elif bearish_conditions:
         trade_signal = "PUTS"
-        conviction = " ★ High conviction — ORB + LE Model aligned." if high_conviction else ""
+        if ultra_conviction:
+            conviction_tag = " ★★ Ultra conviction — ORB + LE Model + Bear 180 all aligned."
+        elif high_conviction:
+            conviction_tag = " ★ High conviction — ORB + LE Model aligned."
+        else:
+            conviction_tag = ""
         signal_reason = (
             f"{ticker} is bearish: VWAP ({vwap:.2f}) > EMA9 ({ema9:.2f}) > price ({current_price:.2f}), "
-            f"rubber band tight, kiss confirmed.{conviction}"
+            f"rubber band tight, kiss confirmed.{conviction_tag}"
         )
+        if p180_confirms_bearish:
+            signal_reason += f" {pattern_180['description']}"
+        elif p180_confirms_bullish:
+            signal_reason += f" ⚠ Conflicting Bull 180 on last bar — proceed with caution."
+
     else:
         trade_signal = "WAIT"
         if active_zone:
@@ -298,14 +390,15 @@ async def get_analysis(
                 reasons.append("kill switch active (wrong side of EMA9)")
             if not market_open:
                 reasons.append("market is closed")
-            # ORB-specific blocking reasons
             if orb_required and orb_breakout == "NONE" and orb_high is not None and orb_low is not None:
                 reasons.append(f"price inside opening range (ORB: ${orb_low:.2f}–${orb_high:.2f}), wait for breakout")
             elif orb_required and orb_breakout == "UP" and gate2_stack == "BEARISH":
-                reasons.append(f"ORB broke UP but stack is BEARISH — systems conflict")
+                reasons.append("ORB broke UP but stack is BEARISH — systems conflict")
             elif orb_required and orb_breakout == "DOWN" and gate2_stack == "BULLISH":
-                reasons.append(f"ORB broke DOWN but stack is BULLISH — systems conflict")
+                reasons.append("ORB broke DOWN but stack is BULLISH — systems conflict")
             signal_reason = "Waiting: " + "; ".join(reasons) + "." if reasons else "Conditions not fully met."
+            if pattern_180["detected"]:
+                signal_reason += f" Note: {pattern_180['description']}"
 
     return {
         "ticker": ticker.upper(),
@@ -324,6 +417,8 @@ async def get_analysis(
         "orbLow": orb_low,
         "orbBreakout": orb_breakout,
         "highConviction": high_conviction,
+        "ultraConviction": ultra_conviction,
+        "pattern180": pattern_180,
         "lastBarTime": last_bar_time,
         "tradeSignal": trade_signal,
         "signalReason": signal_reason,
@@ -366,7 +461,6 @@ async def get_insight(body: InsightRequest):
     if body.noEntryZoneName:
         conditions_failed.append(f"in no-entry zone: {body.noEntryZoneName}")
 
-    # ORB context
     orb_lines = []
     if body.orbEstablished:
         orb_range = f"${body.orbHigh:.2f}–${body.orbLow:.2f} (range ${(body.orbHigh - body.orbLow):.2f})" if body.orbHigh and body.orbLow else "established"

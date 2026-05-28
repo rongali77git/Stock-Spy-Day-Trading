@@ -5,9 +5,10 @@ const STORAGE_KEY = "selectedTicker";
 const DEFAULT_TICKER = "SPY";
 
 export const POPULAR_TICKERS = [
-  "SPY", "QQQ", "AAPL", "TSLA", "NVDA",
-  "MSFT", "AMZN", "META", "AMD", "GOOGL",
+  "SPY",  "QQQ",  "AAPL", "TSLA", "NVDA",
+  "MSFT", "AMZN", "META", "AMD",  "GOOGL",
   "COIN", "PLTR", "SOFI", "MSTR", "IWM",
+  "SNOW", "ARM",  "HOOD", "CRWD", "IONQ",
 ];
 
 export function useTicker() {
